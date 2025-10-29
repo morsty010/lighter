@@ -3,157 +3,161 @@ import os
 import time
 import argparse
 from dotenv import load_dotenv
-from lighter_sdk.lighter import Lighter
+import lighter  # 正确导入
 
 load_dotenv()
 
-def get_position(lighter, ticker):
-    """
-    Get current position for ticker.
-    Assumes lighter.account() returns {'positions': [{'symbol': str, 'size': float, 'avgEntryPrice': float, ...}]}
-    """
-    account = asyncio.run(lighter.account())
+def get_position(client, ticker):
+    """获取仓位：用 AccountApi.get_account，假设返回 positions list。"""
+    account_api = lighter.AccountApi(client)
+    # 假设你的账户 index=1，调整为你的（从 get_info.py 查）
+    account = asyncio.run(account_api.get_account(by="index", value="1"))
     for pos in account.get('positions', []):
-        if pos.get('symbol') == ticker:
+        if pos.get('symbol') == ticker.upper():  # BTC -> BTC-USD? 调整 symbol
             return pos
     return None
 
-async def place_sl_tp(lighter, ticker, entry_price, close_side, take_profit_pct, stop_loss_pct):
-    """
-    Place take profit and stop loss orders.
-    Assumes SDK supports stop orders via limit_order with trigger_price or separate method.
-    For simplicity, using limit_order for TP (limit), and assume a stop_market method or simulate.
-    Note: Adjust based on actual SDK; this is placeholder.
-    """
-    close_amount = -1  # full reduce, but use current size
-    pos = get_position(lighter, ticker)
-    if pos:
-        close_amount = abs(pos['size'])
+async def place_sl_tp(client, ticker, entry_price, close_side, take_profit_pct, stop_loss_pct):
+    """放置 TP (limit) 和 SL (stop market)，reduce_only=True。"""
+    order_api = lighter.OrderApi(client)
+    pos = get_position(client, ticker)
+    if not pos:
+        return
+    close_size = abs(pos['size'])  # full close
 
-    # For TP: limit order on close_side at tp_price, reduce_only=True
-    tp_multiplier = 1 + take_profit_pct if close_side == 'sell' else 1 - take_profit_pct
-    tp_price = entry_price * tp_multiplier
-    await lighter.limit_order(
-        ticker=ticker,
-        amount= -close_amount if close_side == 'sell' else close_amount,
+    # TP: limit order
+    side = 'SELL' if close_side == 'sell' else 'BUY'
+    tp_price = entry_price * (1 + take_profit_pct if side == 'SELL' else 1 - take_profit_pct)
+    # 从 examples/create_cancel_order.py 复制真实调用，调整 params
+    tp_order = await order_api.create_order(
+        symbol=ticker,
+        side=side,
+        size=close_size,
         price=tp_price,
-        reduce_only=True  # assume param
+        type='limit',
+        reduce_only=True
     )
-    print(f"Placed TP {close_side} limit at {tp_price}")
+    print(f"Placed TP {close_side} limit at {tp_price}, order: {tp_order}")
 
-    # For SL: stop market order, trigger at sl_trigger, then market close
-    sl_multiplier = 1 + stop_loss_pct if close_side == 'sell' else 1 - stop_loss_pct
-    sl_trigger = entry_price * sl_multiplier
-    # Assume SDK has stop_market_order(ticker, amount, trigger_price, reduce_only)
-    # Placeholder: await lighter.stop_market_order(ticker=ticker, amount= -close_amount if close_side == 'sell' else close_amount, trigger_price=sl_trigger, reduce_only=True)
-    print(f"Placed SL {close_side} stop market trigger at {sl_trigger}")
-    # Implement actual SL placement based on SDK docs
+    # SL: stop market
+    sl_trigger = entry_price * (1 + stop_loss_pct if side == 'SELL' else 1 - stop_loss_pct)
+    sl_order = await order_api.create_order(
+        symbol=ticker,
+        side=side,
+        size=close_size,
+        trigger_price=sl_trigger,  # 或 stop_price
+        type='stop_market',
+        reduce_only=True
+    )
+    print(f"Placed SL {close_side} stop at {sl_trigger}, order: {sl_order}")
 
-async def close_position(lighter, ticker, close_side):
-    """
-    Close position with market order.
-    """
-    pos = get_position(lighter, ticker)
+async def close_position(client, ticker, close_side):
+    """市价平仓。"""
+    order_api = lighter.OrderApi(client)
+    pos = get_position(client, ticker)
     if not pos or pos['size'] == 0:
         return
-    amount = -pos['size'] if close_side == 'sell' else pos['size']
-    res = await lighter.market_order(ticker=ticker, amount=amount)
-    print(f"Closed position with market {close_side}")
+    side = 'SELL' if close_side == 'sell' else 'BUY'
+    size = abs(pos['size'])
+    res = await order_api.create_order(
+        symbol=ticker,
+        side=side,
+        size=size,
+        type='market',
+        reduce_only=True
+    )
+    print(f"Closed with market {close_side}, res: {res}")
 
 async def main():
-    parser = argparse.ArgumentParser(description="Modified Perp DEX Trading Bot for Lighter")
+    parser = argparse.ArgumentParser(description="Lighter Trading Bot")
     parser.add_argument('--exchange', default='lighter')
     parser.add_argument('--ticker', default='BTC')
     parser.add_argument('--quantity', type=float, default=0.00045)
-    parser.add_argument('--take-profit', type=float, default=0.03)  # Overridden to 3%
-    parser.add_argument('--stop-loss', type=float, default=-0.03)  # Added, -3%
-    parser.add_argument('--env-file', default='.env')
+    parser.add_argument('--take-profit', type=float, default=0.03)
+    parser.add_argument('--stop-price', type=float, default=-0.03)  # 用这个！
+    parser.add_argument('--direction', default='buy', choices=['buy', 'sell'])
     parser.add_argument('--max-orders', type=int, default=1)
     parser.add_argument('--wait-time', type=int, default=20)
+    parser.add_argument('--env-file', default='.env')
     parser.add_argument('--grid-step', type=float, default=0.01)
-    parser.add_argument('--direction', default='buy')  # Added default
     args = parser.parse_args()
 
-    if args.env_file:
-        load_dotenv(args.env_file)
+    load_dotenv(args.env_file)
+    private_key = os.getenv('PRIVATE_KEY') or os.getenv('LIGHTER_API_SECRET')
+    if not private_key:
+        raise ValueError("Set PRIVATE_KEY or LIGHTER_API_SECRET in .env (your wallet private key)")
 
-    # Assume env vars: LIGHTER_API_KEY, LIGHTER_API_SECRET
-    key = os.getenv('LIGHTER_API_KEY')
-    secret = os.getenv('LIGHTER_API_SECRET')
-    if not key or not secret:
-        raise ValueError("Missing API key/secret in .env")
+    # 初始化（从 examples 风格）
+    client = lighter.ApiClient(private_key=private_key)
+    # 如果需要 RPC URL： client = lighter.ApiClient(private_key=private_key, rpc_url='your_starknet_rpc')
 
-    lighter = Lighter(key=key, secret=secret)
-    await lighter.init_client()
-
-    ticker = args.ticker
+    ticker = f"{args.ticker}-USD"  # Lighter symbol 通常是 BTC-USD，确认 docs
     quantity = args.quantity
     direction = args.direction
-    open_side = direction  # 'buy' to open long
     close_side = 'sell' if direction == 'buy' else 'buy'
-    open_amount = quantity if direction == 'buy' else -quantity
+    open_side = 'BUY' if direction == 'buy' else 'SELL'
+    open_size = quantity
 
+    order_api = lighter.OrderApi(client)
     start_time = time.time()
     filled = False
     entry_price = 0
 
-    while not filled and (time.time() - start_time < 1800):  # 30 min timeout
-        print("Placing market order to open...")
-        res = await lighter.market_order(ticker=ticker, amount=open_amount)
-        if 'orders' in res and res['orders']:
-            order_id = res['orders'][0]['order_id']
+    while not filled and (time.time() - start_time < 1800):
+        print(f"Placing {direction} market order for {open_size} {ticker}...")
+        # 真实 market order 调用（从 examples 复制 params）
+        res = await order_api.create_order(
+            symbol=ticker,
+            side=open_side,
+            size=open_size,
+            type='market'
+        )
+        if 'order_id' in res:  # 假设返回 dict with order_id
+            order_id = res['order_id']
+            print(f"Order placed: {order_id}")
 
-            await asyncio.sleep(1)  # Wait 1 second
+            await asyncio.sleep(1)  # 1s 检查
 
-            active_orders = await lighter.account_active_orders(ticker=ticker)
-            order_still_active = any(o.get('order_id') == order_id for o in active_orders)
+            # 检查活跃订单（假设 get_open_orders 方法）
+            active_orders = await order_api.get_open_orders(symbol=ticker)
+            order_still_active = any(o.get('order_id') == order_id for o in active_orders or [])
 
             if not order_still_active:
-                print("Order filled!")
+                print("Order filled in 1s!")
                 filled = True
-                # Get entry price from position
-                pos = get_position(lighter, ticker)
-                if pos and pos['size'] != 0:
-                    entry_price = pos.get('avgEntryPrice', 0)
-                    if entry_price == 0:
-                        # Fallback: get current price or from res
-                        # Assume res has 'avgPrice'
-                        entry_price = res.get('avgPrice', 0)  # Placeholder
-                else:
-                    print("No position found after fill")
-                    continue
+                pos = get_position(client, ticker)
+                entry_price = pos.get('avgEntryPrice', 0) if pos else 0
+                if entry_price == 0:
+                    # Fallback: 从 fills 或 ticker price
+                    print("Warning: Entry price not fetched, set manually if needed")
             else:
-                print("Order not filled in 1s, canceling...")
-                await lighter.cancel_order(ticker=ticker, order_id=order_id)
-        else:
-            print("Failed to place order")
+                print("Not filled, canceling...")
+                await order_api.cancel_order(order_id=order_id, symbol=ticker)
 
         if not filled:
             await asyncio.sleep(args.wait_time)
 
     if not filled:
-        print("Failed to open position within timeout")
+        print("Timeout: No position opened")
         return
 
-    print(f"Opened position at entry price: {entry_price}")
+    print(f"Opened at ~{entry_price}")
 
-    # Place TP and SL
-    await place_sl_tp(lighter, ticker, entry_price, close_side, args.take_profit, args.stop_loss)
+    # TP/SL
+    await place_sl_tp(client, ticker, entry_price, close_side, args.take_profit, args.stop_price)
 
-    # Hold for 5 minutes, then close if still open
+    # 持仓 5min
     hold_start = time.time()
-    while (time.time() - hold_start < 300):  # 5 min
-        pos = get_position(lighter, ticker)
-        if pos is None or pos.get('size', 0) == 0:
-            print("Position closed by TP/SL")
+    while time.time() - hold_start < 300:
+        pos = get_position(client, ticker)
+        if not pos or abs(pos.get('size', 0)) < 0.00001:  # ~0
+            print("Position closed early (TP/SL?)")
             return
-        await asyncio.sleep(5)  # Check every 5s
+        await asyncio.sleep(5)
+        print("Holding...")
 
-    # Close after 5 min
-    print("Holding period over, closing position...")
-    await close_position(lighter, ticker, close_side)
-
-    print("Trading session complete.")
+    await close_position(client, ticker, close_side)
+    print("Done!")
 
 if __name__ == "__main__":
     asyncio.run(main())
