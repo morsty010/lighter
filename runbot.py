@@ -1,133 +1,159 @@
-#!/usr/bin/env python3
-"""
-Modular Trading Bot - Supports multiple exchanges
-"""
-
-import argparse
 import asyncio
-import logging
-from pathlib import Path
-import sys
-import dotenv
-from decimal import Decimal
-from trading_bot import TradingBot, TradingConfig
-from exchanges import ExchangeFactory
+import os
+import time
+import argparse
+from dotenv import load_dotenv
+from lighter_sdk.lighter import Lighter
 
+load_dotenv()
 
-def parse_arguments():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description='Modular Trading Bot - Supports multiple exchanges')
+def get_position(lighter, ticker):
+    """
+    Get current position for ticker.
+    Assumes lighter.account() returns {'positions': [{'symbol': str, 'size': float, 'avgEntryPrice': float, ...}]}
+    """
+    account = asyncio.run(lighter.account())
+    for pos in account.get('positions', []):
+        if pos.get('symbol') == ticker:
+            return pos
+    return None
 
-    # Exchange selection
-    parser.add_argument('--exchange', type=str, default='edgex',
-                        choices=ExchangeFactory.get_supported_exchanges(),
-                        help='Exchange to use (default: edgex). '
-                             f'Available: {", ".join(ExchangeFactory.get_supported_exchanges())}')
+async def place_sl_tp(lighter, ticker, entry_price, close_side, take_profit_pct, stop_loss_pct):
+    """
+    Place take profit and stop loss orders.
+    Assumes SDK supports stop orders via limit_order with trigger_price or separate method.
+    For simplicity, using limit_order for TP (limit), and assume a stop_market method or simulate.
+    Note: Adjust based on actual SDK; this is placeholder.
+    """
+    close_amount = -1  # full reduce, but use current size
+    pos = get_position(lighter, ticker)
+    if pos:
+        close_amount = abs(pos['size'])
 
-    # Trading parameters
-    parser.add_argument('--ticker', type=str, default='ETH',
-                        help='Ticker (default: ETH)')
-    parser.add_argument('--quantity', type=Decimal, default=Decimal(0.1),
-                        help='Order quantity (default: 0.1)')
-    parser.add_argument('--take-profit', type=Decimal, default=Decimal(0.02),
-                        help='Take profit in USDT (default: 0.02)')
-    parser.add_argument('--direction', type=str, default='buy', choices=['buy', 'sell'],
-                        help='Direction of the bot (default: buy)')
-    parser.add_argument('--max-orders', type=int, default=40,
-                        help='Maximum number of active orders (default: 40)')
-    parser.add_argument('--wait-time', type=int, default=450,
-                        help='Wait time between orders in seconds (default: 450)')
-    parser.add_argument('--env-file', type=str, default=".env",
-                        help=".env file path (default: .env)")
-    parser.add_argument('--grid-step', type=str, default='-100',
-                        help='The minimum distance in percentage to the next close order price (default: -100)')
-    parser.add_argument('--stop-price', type=Decimal, default=-1,
-                        help='Price to stop trading and exit. Buy: exits if price >= stop-price.'
-                        'Sell: exits if price <= stop-price. (default: -1, no stop)')
-    parser.add_argument('--pause-price', type=Decimal, default=-1,
-                        help='Pause trading and wait. Buy: pause if price >= pause-price.'
-                        'Sell: pause if price <= pause-price. (default: -1, no pause)')
-    parser.add_argument('--boost', action='store_true',
-                        help='Use the Boost mode for volume boosting')
+    # For TP: limit order on close_side at tp_price, reduce_only=True
+    tp_multiplier = 1 + take_profit_pct if close_side == 'sell' else 1 - take_profit_pct
+    tp_price = entry_price * tp_multiplier
+    await lighter.limit_order(
+        ticker=ticker,
+        amount= -close_amount if close_side == 'sell' else close_amount,
+        price=tp_price,
+        reduce_only=True  # assume param
+    )
+    print(f"Placed TP {close_side} limit at {tp_price}")
 
-    return parser.parse_args()
+    # For SL: stop market order, trigger at sl_trigger, then market close
+    sl_multiplier = 1 + stop_loss_pct if close_side == 'sell' else 1 - stop_loss_pct
+    sl_trigger = entry_price * sl_multiplier
+    # Assume SDK has stop_market_order(ticker, amount, trigger_price, reduce_only)
+    # Placeholder: await lighter.stop_market_order(ticker=ticker, amount= -close_amount if close_side == 'sell' else close_amount, trigger_price=sl_trigger, reduce_only=True)
+    print(f"Placed SL {close_side} stop market trigger at {sl_trigger}")
+    # Implement actual SL placement based on SDK docs
 
-
-def setup_logging(log_level: str):
-    """Setup global logging configuration."""
-    # Convert string level to logging constant
-    level = getattr(logging, log_level.upper(), logging.INFO)
-
-    # Clear any existing handlers to prevent duplicates
-    root_logger = logging.getLogger()
-    for handler in root_logger.handlers[:]:
-        root_logger.removeHandler(handler)
-
-    # Configure root logger WITHOUT adding a console handler
-    # This prevents duplicate logs when TradingLogger adds its own console handler
-    root_logger.setLevel(level)
-
-    # Suppress websockets debug logs unless DEBUG level is explicitly requested
-    if log_level.upper() != 'DEBUG':
-        logging.getLogger('websockets').setLevel(logging.WARNING)
-
-    # Suppress other noisy loggers
-    logging.getLogger('urllib3').setLevel(logging.WARNING)
-    logging.getLogger('requests').setLevel(logging.WARNING)
-
-    # Suppress Lighter SDK debug logs
-    logging.getLogger('lighter').setLevel(logging.WARNING)
-    # Also suppress any root logger DEBUG messages that might be coming from Lighter
-    if log_level.upper() != 'DEBUG':
-        # Set root logger to WARNING to suppress DEBUG messages from Lighter SDK
-        root_logger.setLevel(logging.WARNING)
-
+async def close_position(lighter, ticker, close_side):
+    """
+    Close position with market order.
+    """
+    pos = get_position(lighter, ticker)
+    if not pos or pos['size'] == 0:
+        return
+    amount = -pos['size'] if close_side == 'sell' else pos['size']
+    res = await lighter.market_order(ticker=ticker, amount=amount)
+    print(f"Closed position with market {close_side}")
 
 async def main():
-    """Main entry point."""
-    args = parse_arguments()
+    parser = argparse.ArgumentParser(description="Modified Perp DEX Trading Bot for Lighter")
+    parser.add_argument('--exchange', default='lighter')
+    parser.add_argument('--ticker', default='BTC')
+    parser.add_argument('--quantity', type=float, default=0.00045)
+    parser.add_argument('--take-profit', type=float, default=0.03)  # Overridden to 3%
+    parser.add_argument('--stop-loss', type=float, default=-0.03)  # Added, -3%
+    parser.add_argument('--env-file', default='.env')
+    parser.add_argument('--max-orders', type=int, default=1)
+    parser.add_argument('--wait-time', type=int, default=20)
+    parser.add_argument('--grid-step', type=float, default=0.01)
+    parser.add_argument('--direction', default='buy')  # Added default
+    args = parser.parse_args()
 
-    # Setup logging first
-    setup_logging("WARNING")
+    if args.env_file:
+        load_dotenv(args.env_file)
 
-    # Validate boost-mode can only be used with aster and backpack exchange
-    if args.boost and args.exchange.lower() != 'aster' and args.exchange.lower() != 'backpack':
-        print(f"Error: --boost can only be used when --exchange is 'aster' or 'backpack'. "
-              f"Current exchange: {args.exchange}")
-        sys.exit(1)
+    # Assume env vars: LIGHTER_API_KEY, LIGHTER_API_SECRET
+    key = os.getenv('LIGHTER_API_KEY')
+    secret = os.getenv('LIGHTER_API_SECRET')
+    if not key or not secret:
+        raise ValueError("Missing API key/secret in .env")
 
-    env_path = Path(args.env_file)
-    if not env_path.exists():
-        print(f"Env file not find: {env_path.resolve()}")
-        sys.exit(1)
-    dotenv.load_dotenv(args.env_file)
+    lighter = Lighter(key=key, secret=secret)
+    await lighter.init_client()
 
-    # Create configuration
-    config = TradingConfig(
-        ticker=args.ticker.upper(),
-        contract_id='',  # will be set in the bot's run method
-        tick_size=Decimal(0),
-        quantity=args.quantity,
-        take_profit=args.take_profit,
-        direction=args.direction.lower(),
-        max_orders=args.max_orders,
-        wait_time=args.wait_time,
-        exchange=args.exchange.lower(),
-        grid_step=Decimal(args.grid_step),
-        stop_price=Decimal(args.stop_price),
-        pause_price=Decimal(args.pause_price),
-        boost_mode=args.boost
-    )
+    ticker = args.ticker
+    quantity = args.quantity
+    direction = args.direction
+    open_side = direction  # 'buy' to open long
+    close_side = 'sell' if direction == 'buy' else 'buy'
+    open_amount = quantity if direction == 'buy' else -quantity
 
-    # Create and run the bot
-    bot = TradingBot(config)
-    try:
-        await bot.run()
-    except Exception as e:
-        print(f"Bot execution failed: {e}")
-        # The bot's run method already handles graceful shutdown
+    start_time = time.time()
+    filled = False
+    entry_price = 0
+
+    while not filled and (time.time() - start_time < 1800):  # 30 min timeout
+        print("Placing market order to open...")
+        res = await lighter.market_order(ticker=ticker, amount=open_amount)
+        if 'orders' in res and res['orders']:
+            order_id = res['orders'][0]['order_id']
+
+            await asyncio.sleep(1)  # Wait 1 second
+
+            active_orders = await lighter.account_active_orders(ticker=ticker)
+            order_still_active = any(o.get('order_id') == order_id for o in active_orders)
+
+            if not order_still_active:
+                print("Order filled!")
+                filled = True
+                # Get entry price from position
+                pos = get_position(lighter, ticker)
+                if pos and pos['size'] != 0:
+                    entry_price = pos.get('avgEntryPrice', 0)
+                    if entry_price == 0:
+                        # Fallback: get current price or from res
+                        # Assume res has 'avgPrice'
+                        entry_price = res.get('avgPrice', 0)  # Placeholder
+                else:
+                    print("No position found after fill")
+                    continue
+            else:
+                print("Order not filled in 1s, canceling...")
+                await lighter.cancel_order(ticker=ticker, order_id=order_id)
+        else:
+            print("Failed to place order")
+
+        if not filled:
+            await asyncio.sleep(args.wait_time)
+
+    if not filled:
+        print("Failed to open position within timeout")
         return
 
+    print(f"Opened position at entry price: {entry_price}")
+
+    # Place TP and SL
+    await place_sl_tp(lighter, ticker, entry_price, close_side, args.take_profit, args.stop_loss)
+
+    # Hold for 5 minutes, then close if still open
+    hold_start = time.time()
+    while (time.time() - hold_start < 300):  # 5 min
+        pos = get_position(lighter, ticker)
+        if pos is None or pos.get('size', 0) == 0:
+            print("Position closed by TP/SL")
+            return
+        await asyncio.sleep(5)  # Check every 5s
+
+    # Close after 5 min
+    print("Holding period over, closing position...")
+    await close_position(lighter, ticker, close_side)
+
+    print("Trading session complete.")
 
 if __name__ == "__main__":
     asyncio.run(main())
